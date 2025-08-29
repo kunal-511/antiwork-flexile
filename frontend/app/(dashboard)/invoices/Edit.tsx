@@ -260,29 +260,22 @@ const Edit = () => {
     );
 
   const handleDocumentDataExtracted = (extractedData: {
-    description: string;
-    quantity: string;
-    hourly: boolean;
-    payRateInSubunits: number;
+    lineItems: {
+      description: string;
+      quantity: string;
+      hourly: boolean;
+      payRateInSubunits: number;
+    }[];
     invoiceDate: string;
   }) => {
-    if (lineItems.size > 0) {
-      updateLineItem(0, {
-        description: extractedData.description,
-        quantity: extractedData.quantity,
-        hourly: extractedData.hourly,
-        pay_rate_in_subunits: extractedData.payRateInSubunits,
-      });
-    } else {
-      setLineItems((lineItems) =>
-        lineItems.push({
-          description: extractedData.description,
-          quantity: extractedData.quantity,
-          hourly: extractedData.hourly,
-          pay_rate_in_subunits: extractedData.payRateInSubunits,
-        }),
-      );
-    }
+    const newLineItems = extractedData.lineItems.map((item) => ({
+      description: item.description,
+      quantity: item.quantity,
+      hourly: item.hourly,
+      pay_rate_in_subunits: item.payRateInSubunits,
+    }));
+
+    setLineItems(List(newLineItems));
 
     setIssueDate(parseDate(extractedData.invoiceDate));
   };

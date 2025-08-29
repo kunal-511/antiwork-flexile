@@ -2,30 +2,41 @@
 
 import { createOpenAI } from "@ai-sdk/openai";
 import { generateObject } from "ai";
-import { AlertCircle, CheckCircle, FileText, Loader2, Upload, X } from "lucide-react";
-import React, { useCallback, useRef, useState } from "react";
+import { AlertCircle, FileText, Loader2, Upload, X } from "lucide-react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { z } from "zod";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
 import clientEnv from "@/env/client";
 
 // Schema for AI extraction
 const invoiceDataSchema = z.object({
   isInvoice: z.boolean().describe("Whether this document is actually an invoice/receipt/bill (true) or not (false)"),
-  description: z.string().describe("Brief description of services/work performed"),
-  quantity: z.string().describe("Number of hours worked OR quantity of items/services as a string"),
-  hourly: z.boolean().describe("Whether this is hourly work (true) or project-based/fixed (false)"),
-  payRateInSubunits: z.number().describe("Hourly rate or unit price in cents (multiply dollars by 100)"),
+  lineItems: z
+    .array(
+      z.object({
+        description: z.string().describe("Brief description of this specific service/work performed"),
+        quantity: z.string().describe("Number of hours worked OR quantity for this item as a string"),
+        hourly: z.boolean().describe("Whether this line item is hourly work (true) or project-based/fixed (false)"),
+        payRateInSubunits: z
+          .number()
+          .describe("Hourly rate or unit price for this item in cents (multiply dollars by 100)"),
+      }),
+    )
+    .describe("Array of line items from the invoice"),
   invoiceDate: z.string().describe("Invoice date in YYYY-MM-DD format"),
 });
 
-interface ExtractedInvoiceData {
-  isInvoice: boolean;
+interface ExtractedLineItem {
   description: string;
   quantity: string;
   hourly: boolean;
   payRateInSubunits: number;
+}
+
+interface ExtractedInvoiceData {
+  isInvoice: boolean;
+  lineItems: ExtractedLineItem[];
   invoiceDate: string;
 }
 
@@ -39,9 +50,9 @@ type DropZoneState = "idle" | "processing" | "success" | "error" | "not-invoice"
 export default function InvoiceDocumentDropZone({ onDataExtracted, disabled = false }: InvoiceDocumentDropZoneProps) {
   const [state, setState] = useState<DropZoneState>("idle");
   const [errorMessage, setErrorMessage] = useState<string>("");
-  const [extractedData, setExtractedData] = useState<ExtractedInvoiceData | null>(null);
   const [isDragActive, setIsDragActive] = useState(false);
   const [fileName, setFileName] = useState<string>("");
+  const [_, setDragCounter] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const openaiProvider = createOpenAI({
@@ -126,21 +137,31 @@ export default function InvoiceDocumentDropZone({ onDataExtracted, disabled = fa
                 type: "text",
                 text: `FIRST: Determine if this document is an invoice, receipt, bill, or work statement.
 
-If it's NOT an invoice/receipt/bill, set isInvoice=false and provide placeholder values for other fields.
+If it's NOT an invoice/receipt/bill, set isInvoice=false and provide empty lineItems array.
 
-If it IS an invoice/receipt/bill, set isInvoice=true and extract these fields accurately:
-- description: Brief description of the work/service
-- quantity: Number as a string (hours worked or quantity of items)
+If it IS an invoice/receipt/bill, set isInvoice=true and extract each service/product as a SEPARATE line item:
+
+CRITICAL: Extract EACH service/product/work item as a SEPARATE object in the lineItems array.
+- If you see "Consulting Services", "Web Design Project", "Content Management System" - create 3 separate line items
+- If you see multiple rows in a table - create separate line items for each row
+- If services are listed separately - extract each one individually
+
+For each line item:
+- description: Brief description of this specific service/work
+- quantity: Number as a string (hours worked or quantity for this item)
 - hourly: Boolean - true if hourly work, false if fixed price/project
-- payRateInSubunits: Rate in cents (dollars × 100)
+- payRateInSubunits: Rate in cents for this item (dollars × 100)
+
+Global fields:
 - invoiceDate: Date in YYYY-MM-DD format
 
-Rules for invoice extraction:
+Rules for extraction:
 - For hourly work: set hourly=true, extract hours and hourly rate
 - For fixed projects: set hourly=false, quantity="1", extract total amount
 - Convert all dollar amounts to cents (multiply by 100)
 - Use today's date if no date is visible: ${new Date().toISOString().split("T")[0]}
 - Be precise with numbers shown in the document
+- ALWAYS create separate line items for each service/product listed
 
 Examples of invoices: service bills, contractor invoices, freelance receipts, work statements
 Examples of non-invoices: personal photos, random documents, contracts without billing info`,
@@ -149,7 +170,7 @@ Examples of non-invoices: personal photos, random documents, contracts without b
                 ? [
                     {
                       type: "image" as const,
-                      image: fileData.includes(",") ? fileData.split(",")[1] || "" : fileData,
+                      image: fileData.includes(",") ? (fileData.split(",")[1] ?? "") : fileData,
                     },
                   ]
                 : [
@@ -166,6 +187,7 @@ Examples of non-invoices: personal photos, random documents, contracts without b
       });
 
       let extractedData = result.object;
+
       if (
         extractedData &&
         typeof extractedData === "object" &&
@@ -177,18 +199,12 @@ Examples of non-invoices: personal photos, random documents, contracts without b
           properties &&
           typeof properties === "object" &&
           "isInvoice" in properties &&
-          "description" in properties &&
-          "quantity" in properties &&
-          "hourly" in properties &&
-          "payRateInSubunits" in properties &&
+          "lineItems" in properties &&
           "invoiceDate" in properties
         ) {
           extractedData = {
             isInvoice: Boolean(properties.isInvoice),
-            description: String(properties.description),
-            quantity: String(properties.quantity),
-            hourly: Boolean(properties.hourly),
-            payRateInSubunits: Number(properties.payRateInSubunits),
+            lineItems: Array.isArray(properties.lineItems) ? properties.lineItems : [],
             invoiceDate: String(properties.invoiceDate),
           };
         }
@@ -203,13 +219,23 @@ Examples of non-invoices: personal photos, random documents, contracts without b
         throw new Error("NOT_INVOICE");
       }
 
-      if (extractedData.payRateInSubunits < 0 || extractedData.payRateInSubunits > 100000000) {
-        throw new Error("Invalid payment amount detected in the document.");
+      if (!Array.isArray(extractedData.lineItems) || extractedData.lineItems.length === 0) {
+        throw new Error("No line items found in the invoice.");
       }
 
-      const quantityNum = parseFloat(extractedData.quantity);
-      if (isNaN(quantityNum) || quantityNum <= 0 || quantityNum > 10000) {
-        throw new Error("Invalid quantity/hours detected in the document.");
+      for (const item of extractedData.lineItems) {
+        if (!item.description || typeof item.description !== "string") {
+          throw new Error("Invalid service description detected in the document.");
+        }
+
+        if (item.payRateInSubunits < 0 || item.payRateInSubunits > 100000000) {
+          throw new Error("Invalid payment amount detected in the document.");
+        }
+
+        const quantityNum = parseFloat(item.quantity);
+        if (isNaN(quantityNum) || quantityNum <= 0 || quantityNum > 10000) {
+          throw new Error("Invalid quantity/hours detected in the document.");
+        }
       }
 
       // Validate date format
@@ -223,7 +249,7 @@ Examples of non-invoices: personal photos, random documents, contracts without b
         if (error.message === "NOT_INVOICE") {
           throw error;
         }
-        throw new Error(`AI processing failed: ${error.message}`);
+        throw new Error(`processing failed: ${error.message}`);
       }
       throw new Error("Failed to process the document. Please try again or contact support.");
     }
@@ -257,11 +283,12 @@ Examples of non-invoices: personal photos, random documents, contracts without b
 
       try {
         const data = await processDocument(file);
-        setExtractedData(data);
-        setState("success");
         // Remove isInvoice from the data passed to parent
         const { isInvoice, ...invoiceData } = data;
         onDataExtracted(invoiceData);
+        setTimeout(() => {
+          resetState();
+        }, 1000);
       } catch (error) {
         if (error instanceof Error && error.message === "NOT_INVOICE") {
           setState("not-invoice");
@@ -277,44 +304,53 @@ Examples of non-invoices: personal photos, random documents, contracts without b
     [onDataExtracted, disabled],
   );
 
-  const handleDragEnter = useCallback(
-    (e: React.DragEvent) => {
+  useEffect(() => {
+    const handleWindowDragEnter = (e: DragEvent) => {
       e.preventDefault();
-      e.stopPropagation();
-      if (!disabled) {
+      if (!disabled && e.dataTransfer?.types.includes("Files")) {
+        setDragCounter((prev) => prev + 1);
         setIsDragActive(true);
       }
-    },
-    [disabled],
-  );
+    };
 
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    const target = e.currentTarget;
-    const relatedTarget = e.relatedTarget;
-    if (relatedTarget && target instanceof Node && relatedTarget instanceof Node && !target.contains(relatedTarget)) {
-      setIsDragActive(false);
-    }
-  }, []);
-
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-  }, []);
-
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
+    const handleWindowDragLeave = (e: DragEvent) => {
       e.preventDefault();
-      e.stopPropagation();
-      setIsDragActive(false);
+      setDragCounter((prev) => {
+        const newCounter = prev - 1;
+        if (newCounter <= 0) {
+          setIsDragActive(false);
+          return 0;
+        }
+        return newCounter;
+      });
+    };
 
-      if (!disabled && e.dataTransfer.files) {
+    const handleWindowDragOver = (e: DragEvent) => {
+      e.preventDefault();
+    };
+
+    const handleWindowDrop = (e: DragEvent) => {
+      e.preventDefault();
+      setIsDragActive(false);
+      setDragCounter(0);
+
+      if (!disabled && e.dataTransfer?.files) {
         handleFiles(e.dataTransfer.files);
       }
-    },
-    [disabled, handleFiles],
-  );
+    };
+
+    window.addEventListener("dragenter", handleWindowDragEnter);
+    window.addEventListener("dragleave", handleWindowDragLeave);
+    window.addEventListener("dragover", handleWindowDragOver);
+    window.addEventListener("drop", handleWindowDrop);
+
+    return () => {
+      window.removeEventListener("dragenter", handleWindowDragEnter);
+      window.removeEventListener("dragleave", handleWindowDragLeave);
+      window.removeEventListener("dragover", handleWindowDragOver);
+      window.removeEventListener("drop", handleWindowDrop);
+    };
+  }, [disabled, handleFiles]);
 
   const handleFileInput = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -325,168 +361,103 @@ Examples of non-invoices: personal photos, random documents, contracts without b
     [handleFiles],
   );
 
-  const handleClick = useCallback(() => {
-    if (!disabled && fileInputRef.current && state === "idle") {
-      fileInputRef.current.click();
-    }
-  }, [disabled, state]);
-
   const resetState = () => {
     setState("idle");
     setErrorMessage("");
-    setExtractedData(null);
     setFileName("");
+    setDragCounter(0);
+    setIsDragActive(false);
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
   };
 
-  const getCardStyles = () => {
-    const baseClasses = "transition-all duration-300 border-2";
-
-    switch (state) {
-      case "success":
-        return `${baseClasses} border-green-400 bg-green-50 shadow-sm`;
-      case "error":
-        return `${baseClasses} border-red-400 bg-red-50 shadow-sm`;
-      case "not-invoice":
-        return `${baseClasses} border-orange-400 bg-orange-50 shadow-sm`;
-      case "processing":
-        return `${baseClasses} border-blue-400 bg-blue-50 shadow-md`;
-      default:
-        return isDragActive
-          ? `${baseClasses} border-blue-500 bg-blue-50 shadow-lg scale-[1.02]`
-          : `${baseClasses} border-dashed border-gray-300 bg-gray-50 hover:bg-gray-100 hover:border-gray-400`;
-    }
-  };
-
   return (
-    <div className="w-full space-y-4">
-      <Card className={getCardStyles()}>
-        <CardContent className="p-6">
-          <div
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDragOver={handleDragOver}
-            onDrop={handleDrop}
-            onClick={handleClick}
-            className={`flex min-h-[120px] flex-col justify-center text-center ${disabled ? "cursor-not-allowed opacity-50" : state === "idle" ? "cursor-pointer" : ""} `}
-          >
-            <input
-              ref={fileInputRef}
-              type="file"
-              onChange={handleFileInput}
-              accept="image/*,application/pdf,text/plain"
-              className="hidden"
-              disabled={disabled}
-            />
+    <>
+      <input
+        ref={fileInputRef}
+        type="file"
+        onChange={handleFileInput}
+        accept="image/*,application/pdf,text/plain"
+        className="hidden"
+        disabled={disabled}
+      />
 
-            <div className="flex flex-col items-center space-y-3">
-              {state === "processing" && (
-                <>
-                  <Loader2 className="h-10 w-10 animate-spin text-blue-600" />
-                  <div className="space-y-1">
-                    <p className="text-lg font-semibold text-blue-900">Analyzing document...</p>
-                    {fileName ? <p className="max-w-xs truncate text-xs text-gray-500">{fileName}</p> : null}
-                  </div>
-                </>
-              )}
-
-              {state === "success" && (
-                <>
-                  <CheckCircle className="h-10 w-10 text-green-600" />
-                  <div className="space-y-1">
-                    <p className="text-lg font-semibold text-green-800">Invoice processed successfully!</p>
-                    <p className="text-sm text-green-600">Your form has been filled automatically</p>
-                  </div>
-                </>
-              )}
-
-              {state === "not-invoice" && (
-                <>
-                  <FileText className="h-10 w-10 text-orange-500" />
-                  <div className="space-y-1">
-                    <p className="text-lg font-semibold text-orange-800">Not an invoice document</p>
-                    <p className="text-sm text-orange-600">Please upload a billing document instead</p>
-                  </div>
-                </>
-              )}
-
-              {state === "error" && (
-                <>
-                  <AlertCircle className="h-10 w-10 text-red-500" />
-                  <div className="space-y-1">
-                    <p className="text-lg font-semibold text-red-700">Processing failed</p>
-                    <p className="text-sm text-red-600">Please try again or fill the form manually</p>
-                  </div>
-                </>
-              )}
-
-              {state === "idle" && (
-                <>
-                  <div className="flex items-center space-x-3">
-                    <Upload
-                      className={`h-8 w-8 transition-colors ${isDragActive ? "text-blue-500" : "text-gray-400"}`}
-                    />
-                    <FileText
-                      className={`h-8 w-8 transition-colors ${isDragActive ? "text-blue-500" : "text-gray-400"}`}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <p
-                      className={`text-lg font-medium transition-colors ${isDragActive ? "text-blue-700" : "text-gray-700"}`}
-                    >
-                      {isDragActive ? "Drop your invoice here" : "Upload invoice or receipt"}
-                    </p>
-                    <p className="text-sm text-gray-500">Drag & drop or click to browse</p>
-                    <p className="text-xs text-gray-400">Supports: Images (JPG, PNG, WebP), PDF, Text • Max 10MB</p>
-                  </div>
-                </>
-              )}
-            </div>
-          </div>
-
-          {(state === "success" || state === "error" || state === "not-invoice") && (
-            <div className="mt-6 flex justify-center">
-              <Button variant="outline" size="small" onClick={resetState} className="gap-2">
-                <X className="h-4 w-4" />
-                Try Another Document
-              </Button>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {errorMessage && (state === "error" || state === "not-invoice") ? (
-        <Alert variant={state === "not-invoice" ? "default" : "destructive"} className="border-l-4">
-          <AlertCircle className="h-4 w-4" />
-          <AlertDescription className="text-sm leading-relaxed">{errorMessage}</AlertDescription>
-        </Alert>
-      ) : null}
-
-      {state === "success" && extractedData ? (
-        <Alert className="border-l-4 border-l-green-500">
-          <CheckCircle className="h-4 w-4 text-green-600" />
-          <AlertDescription>
-            <div className="space-y-2 text-sm">
-              <p className="mb-2 font-medium text-green-800">Successfully extracted:</p>
-              <div className="grid gap-1 text-gray-700">
-                <p>
-                  <span className="font-medium">Service:</span> {extractedData.description}
-                </p>
-                <p>
-                  <span className="font-medium">Amount:</span> ${(extractedData.payRateInSubunits / 100).toFixed(2)}
-                  {extractedData.quantity !== "1" && ` × ${extractedData.quantity}`}
-                  {extractedData.hourly ? " per hour" : ""}
-                </p>
-                <p>
-                  <span className="font-medium">Date:</span> {extractedData.invoiceDate}
-                </p>
+      {isDragActive ? (
+        <div
+          className="fixed inset-0 z-50 bg-gray-500/20 backdrop-blur-sm transition-all duration-300 ease-out"
+          style={{ cursor: "copy" }}
+        >
+          <div className="flex h-full items-center justify-center">
+            <div className="animate-in fade-in-0 zoom-in-95 scale-100 transform rounded-2xl border-2 border-dashed border-blue-400 bg-white p-12 shadow-2xl duration-300">
+              <div className="flex flex-col items-center space-y-6 text-center">
+                <div className="flex items-center space-x-4">
+                  <Upload className="h-12 w-12 text-blue-500" />
+                  <FileText className="h-12 w-12 text-blue-500" />
+                </div>
+                <div className="space-y-2">
+                  <h2 className="text-2xl font-bold text-gray-900">Drop your invoice here</h2>
+                  <p className="max-w-md text-gray-600">Release to upload and automatically extract invoice data</p>
+                  <p className="text-sm text-gray-400">Supports: Images (JPG, PNG, WebP), PDF, Text • Max 10MB</p>
+                </div>
               </div>
             </div>
-          </AlertDescription>
-        </Alert>
+          </div>
+        </div>
       ) : null}
-    </div>
+
+      {state === "processing" && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="rounded-2xl bg-white p-12 text-center shadow-2xl">
+            <div className="flex flex-col items-center space-y-6">
+              <Loader2 className="h-16 w-16 animate-spin text-blue-600" />
+              <div className="space-y-2">
+                <h2 className="text-2xl font-bold text-blue-900">Analyzing document...</h2>
+                {fileName ? <p className="max-w-xs truncate text-sm text-gray-500">{fileName}</p> : null}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="space-y-4">
+        {errorMessage && (state === "error" || state === "not-invoice") ? (
+          <Alert variant={state === "not-invoice" ? "default" : "destructive"} className="border-l-4">
+            <AlertCircle className="h-4 w-4" />
+            <AlertDescription className="flex items-center justify-between text-sm leading-relaxed">
+              <span>{errorMessage}</span>
+              <Button variant="outline" size="small" onClick={resetState} className="ml-4 gap-2">
+                <X className="h-4 w-4" />
+                Try Again
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : null}
+
+        {state === "not-invoice" && (
+          <Alert variant="default" className="border-l-4 border-l-orange-500">
+            <FileText className="h-4 w-4 text-orange-500" />
+            <AlertDescription className="flex items-center justify-between">
+              <div>
+                <p className="font-medium text-orange-800">Not an invoice document</p>
+                <p className="text-sm text-orange-600">Please upload a billing document instead</p>
+              </div>
+              <Button variant="outline" size="small" onClick={resetState} className="ml-4 gap-2">
+                <Upload className="h-4 w-4" />
+                Try Again
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+
+        {state === "idle" && !isDragActive && (
+          <div className="text-center">
+            <p className="text-sm text-gray-500">
+              Drag and drop an invoice anywhere on this page to auto-fill the form
+            </p>
+          </div>
+        )}
+      </div>
+    </>
   );
 }
